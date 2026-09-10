@@ -1,0 +1,36 @@
+[package]
+name = "recall"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Vector memory over Qdrant with a local ONNX embedder"
+repository = "https://github.com/Ladvien/recall"
+
+[dependencies]
+anyhow = "1"
+# The same pin homelab-voice's server carries (piper-rs 0.2 pins it), so a workspace that
+# uses both links one ONNX Runtime.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# `blocking` because `Embed` is synchronous (the in-process embedder is), so the Ollama
+# embedder is too; an async caller wraps either in `spawn_blocking`.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v5"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = []
+# Fetch and link ort's prebuilt ONNX Runtime. Off by default: an application that
+# already links a runtime (homelab-voice's server does, with CUDA) unifies this crate's
+# `ort` onto its own; the crate's own tests want `--features ort-binaries`.
+ort-binaries = ["ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs"]
+# Register ort's CUDA execution provider for the embedder. Off by default: bge-small is
+# a few milliseconds on a CPU and the GPU is usually somebody else's.
+cuda = ["ort/cuda"]
