@@ -207,6 +207,25 @@ impl Embed for Ollama {
     }
 }
 
+/// No embedder: for a store that is only counted or pruned (a CLI with no model loaded).
+/// `search` and `upsert` fail; `open` on an absent collection fails too, because it
+/// cannot know the dimension.
+pub struct NoEmbed;
+
+impl Embed for NoEmbed {
+    fn dim(&self) -> usize {
+        0
+    }
+
+    fn name(&self) -> &str {
+        "none"
+    }
+
+    fn embed(&self, _: &[String], _: Role) -> Result<Vec<Vec<f32>>> {
+        anyhow::bail!("this store was opened without an embedder")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub qdrant_url: String,
