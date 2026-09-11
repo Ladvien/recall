@@ -263,6 +263,43 @@ pub struct Query {
     pub min_score: f32,
     pub include_private: bool,
     pub kinds: Vec<String>,
+    /// `ts_unix_ms` window, `[since, until)`. A question that names a time ("what did I
+    /// tell you last weekend") is answered by the window, and similarity only ranks
+    /// inside it.
+    pub since_unix_ms: Option<i64>,
+    pub until_unix_ms: Option<i64>,
+    /// Only memories made on this device (`meta.device_id`).
+    pub device_id: Option<String>,
+}
+
+impl Query {
+    /// The filter clauses this query adds beyond its vector, in Qdrant's `must` shape.
+    fn must(&self) -> Vec<Value> {
+        let mut must: Vec<Value> = Vec::new();
+        if let Some(ns) = &self.namespace {
+            must.push(json!({ "key": "namespace", "match": { "value": ns } }));
+        }
+        if !self.include_private {
+            must.push(json!({ "key": "private", "match": { "value": false } }));
+        }
+        if !self.kinds.is_empty() {
+            must.push(json!({ "key": "kind", "match": { "any": self.kinds } }));
+        }
+        if let Some(d) = &self.device_id {
+            must.push(json!({ "key": "device_id", "match": { "value": d } }));
+        }
+        if self.since_unix_ms.is_some() || self.until_unix_ms.is_some() {
+            let mut range = serde_json::Map::new();
+            if let Some(s) = self.since_unix_ms {
+                range.insert("gte".into(), json!(s));
+            }
+            if let Some(u) = self.until_unix_ms {
+                range.insert("lt".into(), json!(u));
+            }
+            must.push(json!({ "key": "ts_unix_ms", "range": range }));
+        }
+        must
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +314,37 @@ pub struct Stats {
     pub dim: usize,
     pub collection: String,
     pub embedder: String,
+}
+
+/// An item read back from a point's payload: the six fixed fields, and every other
+/// string-valued key as `meta`. Integer payload values a later write added (a recall
+/// count, a stamp) are carried as their decimal text, so a reader can parse them back.
+fn item_of(p: &Value) -> Option<Item> {
+    let mut meta = BTreeMap::new();
+    if let Some(o) = p.as_object() {
+        for (k, v) in o {
+            if !matches!(k.as_str(), "namespace" | "kind" | "key" | "text" | "ts_unix_ms" | "private") {
+                match v {
+                    Value::String(s) => {
+                        meta.insert(k.clone(), s.clone());
+                    }
+                    Value::Number(n) => {
+                        meta.insert(k.clone(), n.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(Item {
+        namespace: p["namespace"].as_str()?.to_string(),
+        kind: p["kind"].as_str().unwrap_or("").to_string(),
+        key: p["key"].as_str().unwrap_or("").to_string(),
+        text: p["text"].as_str()?.to_string(),
+        ts_unix_ms: p["ts_unix_ms"].as_i64().unwrap_or(0),
+        private: p["private"].as_bool().unwrap_or(false),
+        meta,
+    })
 }
 
 pub struct Store {
@@ -336,6 +404,8 @@ impl Store {
             ("room", "keyword"),
             ("ts_unix_ms", "integer"),
             ("private", "bool"),
+            ("last_recalled_ms", "integer"),
+            ("recalled", "integer"),
         ] {
             // Idempotent: Qdrant answers success for an index that already exists.
             let _ = self
@@ -389,22 +459,12 @@ impl Store {
             .into_iter()
             .next()
             .context("no query vector")?;
-        let mut must: Vec<Value> = Vec::new();
-        if let Some(ns) = &q.namespace {
-            must.push(json!({ "key": "namespace", "match": { "value": ns } }));
-        }
-        if !q.include_private {
-            must.push(json!({ "key": "private", "match": { "value": false } }));
-        }
-        if !q.kinds.is_empty() {
-            must.push(json!({ "key": "kind", "match": { "any": q.kinds } }));
-        }
         let body = json!({
             "vector": vector,
             "limit": q.top_k.max(1),
             "with_payload": true,
             "score_threshold": q.min_score,
-            "filter": { "must": must },
+            "filter": { "must": q.must() },
         });
         let resp = self.send(self.client.post(self.url("/points/search")).json(&body)).await?;
         anyhow::ensure!(resp.status().is_success(), "search: {}", resp.status());
@@ -413,40 +473,39 @@ impl Store {
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|h| {
-                        let p = &h["payload"];
-                        let mut meta = BTreeMap::new();
-                        if let Some(o) = p.as_object() {
-                            for (k, v) in o {
-                                if !matches!(k.as_str(), "namespace" | "kind" | "key" | "text" | "ts_unix_ms" | "private") {
-                                    if let Some(s) = v.as_str() {
-                                        meta.insert(k.clone(), s.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        Some(Hit {
-                            score: h["score"].as_f64()? as f32,
-                            item: Item {
-                                namespace: p["namespace"].as_str()?.to_string(),
-                                kind: p["kind"].as_str().unwrap_or("").to_string(),
-                                key: p["key"].as_str().unwrap_or("").to_string(),
-                                text: p["text"].as_str()?.to_string(),
-                                ts_unix_ms: p["ts_unix_ms"].as_i64().unwrap_or(0),
-                                private: p["private"].as_bool().unwrap_or(false),
-                                meta,
-                            },
-                        })
-                    })
+                    .filter_map(|h| Some(Hit { score: h["score"].as_f64()? as f32, item: item_of(&h["payload"])? }))
                     .collect()
             })
             .unwrap_or_default();
         Ok(hits)
     }
 
-    /// Delete every point with `ts_unix_ms` before `ts`; with `dry_run` only count them.
-    pub async fn prune_before(&self, ts_unix_ms: i64, dry_run: bool) -> Result<u64> {
-        let filter = json!({ "must": [{ "key": "ts_unix_ms", "range": { "lt": ts_unix_ms } }] });
+    /// The newest `limit` points matching `must`, newest first, with no vector involved:
+    /// what "what do you remember from here" and "forget that" read. Sorted by the
+    /// server over the `ts_unix_ms` index; a Qdrant too old for `order_by` answers an
+    /// error, which is reported rather than silently unsorted.
+    pub async fn scroll(&self, must: Vec<Value>, limit: usize) -> Result<Vec<Item>> {
+        let body = json!({
+            "limit": limit.max(1),
+            "with_payload": true,
+            "with_vector": false,
+            "filter": { "must": must },
+            "order_by": { "key": "ts_unix_ms", "direction": "desc" },
+        });
+        let resp = self.send(self.client.post(self.url("/points/scroll")).json(&body)).await?;
+        anyhow::ensure!(resp.status().is_success(), "scroll: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        let v: Value = resp.json().await?;
+        Ok(v["result"]["points"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|p| item_of(&p["payload"])).collect())
+            .unwrap_or_default())
+    }
+
+    /// Delete every point matching `must` (and none of `must_not`); with `dry_run` only
+    /// count them. The count is exact and taken first, so the number reported is the
+    /// number deleted.
+    pub async fn delete_where(&self, must: Vec<Value>, must_not: Vec<Value>, dry_run: bool) -> Result<u64> {
+        let filter = json!({ "must": must, "must_not": must_not });
         let count: Value = self
             .send(self.client.post(self.url("/points/count")).json(&json!({ "filter": filter, "exact": true })))
             .await?
@@ -462,6 +521,23 @@ impl Store {
             .await?;
         anyhow::ensure!(resp.status().is_success(), "delete: {}", resp.status());
         Ok(n)
+    }
+
+    /// Delete every point with `ts_unix_ms` before `ts`; with `dry_run` only count them.
+    pub async fn prune_before(&self, ts_unix_ms: i64, dry_run: bool) -> Result<u64> {
+        self.delete_where(vec![json!({ "key": "ts_unix_ms", "range": { "lt": ts_unix_ms } })], Vec::new(), dry_run).await
+    }
+
+    /// Merge `payload` into one point's payload (existing keys are overwritten, the rest
+    /// kept). The point's vector and id are untouched, so this is what a recall counter
+    /// or a last-recalled stamp uses.
+    pub async fn set_payload(&self, id: uuid::Uuid, payload: Value) -> Result<()> {
+        let body = json!({ "points": [id.to_string()], "payload": payload });
+        let resp = self
+            .send(self.client.post(format!("{}?wait=true", self.url("/points/payload"))).json(&body))
+            .await?;
+        anyhow::ensure!(resp.status().is_success(), "set payload: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        Ok(())
     }
 
     pub async fn stats(&self) -> Result<Stats> {
@@ -525,11 +601,36 @@ mod tests {
         let store = Store::open(Config { qdrant_url: url, collection: "recall_test".into(), timeout_ms: 5000 }, e).await.unwrap();
         let item = Item { namespace: "t".into(), kind: "fact".into(), key: "filter".into(), text: "the water filter was changed on the third of September".into(), ts_unix_ms: 1, private: false, meta: BTreeMap::new() };
         store.upsert(&[item.clone(), item.clone()]).await.unwrap();
-        let hits = store.search(&Query { namespace: Some("t".into()), text: "when was the water filter changed".into(), top_k: 3, min_score: 0.3, include_private: true, kinds: vec![] }).await.unwrap();
+        let hits = store.search(&Query { namespace: Some("t".into()), text: "when was the water filter changed".into(), top_k: 3, min_score: 0.3, include_private: true, ..Default::default() }).await.unwrap();
         assert_eq!(hits.len(), 1, "idempotent upsert, one point");
         assert!(hits[0].item.text.contains("water filter"));
+        let mut later = item.clone();
+        later.key = "later".into();
+        later.ts_unix_ms = 9;
+        later.meta.insert("device_id".into(), "office".into());
+        store.upsert(&[later.clone()]).await.unwrap();
+        // Newest first, and the window/device filters are the query's own.
+        let ns = json!({ "key": "namespace", "match": { "value": "t" } });
+        let scrolled = store.scroll(vec![ns.clone()], 10).await.unwrap();
+        assert_eq!(scrolled.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), ["later", "filter"]);
+        let windowed = store
+            .search(&Query { namespace: Some("t".into()), text: "water filter".into(), top_k: 3, min_score: 0.0, include_private: true, since_unix_ms: Some(5), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].item.key, "later");
+        let on_office = store
+            .search(&Query { namespace: Some("t".into()), text: "water filter".into(), top_k: 3, min_score: 0.0, include_private: true, device_id: Some("office".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(on_office.len(), 1);
+        // A payload merge keeps the point and adds the key, as text on the way back.
+        store.set_payload(later.id(), json!({ "recalled": 3 })).await.unwrap();
+        let back = store.scroll(vec![ns.clone(), json!({ "key": "key", "match": { "value": "later" } })], 1).await.unwrap();
+        assert_eq!(back[0].meta.get("recalled").map(String::as_str), Some("3"));
         assert_eq!(store.prune_before(2, true).await.unwrap(), 1);
         assert_eq!(store.prune_before(2, false).await.unwrap(), 1);
+        assert_eq!(store.delete_where(vec![ns], Vec::new(), false).await.unwrap(), 1);
         assert_eq!(store.stats().await.unwrap().points, 0);
     }
 }
