@@ -401,6 +401,7 @@ impl Store {
             ("kind", "keyword"),
             ("source", "keyword"),
             ("device_id", "keyword"),
+            ("person", "keyword"),
             ("room", "keyword"),
             ("ts_unix_ms", "integer"),
             ("private", "bool"),
