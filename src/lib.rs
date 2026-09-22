@@ -347,6 +347,31 @@ fn item_of(p: &Value) -> Option<Item> {
     })
 }
 
+/// Where a search's milliseconds went: the query embedding, then the Qdrant hop.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Phases {
+    pub embed_ms: f64,
+    pub hop_ms: f64,
+}
+
+impl Phases {
+    pub fn total_ms(&self) -> f64 {
+        self.embed_ms + self.hop_ms
+    }
+
+    /// Which half, in the fewest words a log field can carry: whichever is over half the
+    /// total. `even` when neither is, which is the normal case and worth saying plainly so
+    /// a reader is not left inferring it from two numbers.
+    pub fn cost(&self) -> &'static str {
+        let total = self.total_ms();
+        match (self.embed_ms > total / 2.0, self.hop_ms > total / 2.0) {
+            (true, _) => "embed",
+            (_, true) => "qdrant",
+            _ => "even",
+        }
+    }
+}
+
 pub struct Store {
     cfg: Config,
     client: reqwest::Client,
@@ -452,6 +477,21 @@ impl Store {
     }
 
     pub async fn search(&self, q: &Query) -> Result<Vec<Hit>> {
+        self.search_timed(q).await.map(|(hits, _)| hits)
+    }
+
+    /// [`Self::search`], with **which half cost what**.
+    ///
+    /// The caller's deadline wraps both halves, so an expired recall could not say whether
+    /// the query embedding or the Qdrant hop ate it — and only one of the two is fixed by a
+    /// bigger number. Measured on this box with the shipped model: the embed is the whole
+    /// cost (single-digit ms idle, tens of ms with the box busy), the hop is **1–3 ms**, and
+    /// a query arriving behind a `Store::upsert` — which embeds a whole exchange under the
+    /// same session — pays the writer's time as well. Returning the split is what makes a
+    /// miss diagnosable in production rather than only in this crate's ignored test
+    /// (`docs/SOTA.md the-half-of-a-recall-that-costs-is-neither-half`).
+    pub async fn search_timed(&self, q: &Query) -> Result<(Vec<Hit>, Phases)> {
+        let started = std::time::Instant::now();
         let embed = self.embed.clone();
         let text = q.text.clone();
         let vector = tokio::task::spawn_blocking(move || embed.embed(&[text], Role::Query))
@@ -460,6 +500,8 @@ impl Store {
             .into_iter()
             .next()
             .context("no query vector")?;
+        let embed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let hop_started = std::time::Instant::now();
         let body = json!({
             "vector": vector,
             "limit": q.top_k.max(1),
@@ -470,7 +512,7 @@ impl Store {
         let resp = self.send(self.client.post(self.url("/points/search")).json(&body)).await?;
         anyhow::ensure!(resp.status().is_success(), "search: {}", resp.status());
         let v: Value = resp.json().await?;
-        let hits = v["result"]
+        let hops = v["result"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -478,7 +520,8 @@ impl Store {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(hits)
+        let phases = Phases { embed_ms, hop_ms: hop_started.elapsed().as_secs_f64() * 1000.0 };
+        Ok((hops, phases))
     }
 
     /// The newest `limit` points matching `must`, newest first, with no vector involved:
@@ -633,5 +676,163 @@ mod tests {
         assert_eq!(store.prune_before(2, false).await.unwrap(), 1);
         assert_eq!(store.delete_where(vec![ns], Vec::new(), false).await.unwrap(), 1);
         assert_eq!(store.stats().await.unwrap().points, 0);
+    }
+
+    /// **Where the recall deadline actually goes**: the query embedding or the Qdrant hop.
+    ///
+    /// Measured because a deadline miss is only fixable once the half that costs is named,
+    /// and only one of the two halves moves with a bigger number: `[memory] deadline_ms` is
+    /// **150** and this box's `voice_memory` answered a scroll in **6 ms** over loopback,
+    /// so a 150 ms miss is not the network. `Onnx::load` builds its session with
+    /// `with_intra_threads(2)` on a 12-core box, which is the knob this measures.
+    ///
+    /// `RECALL_TEST_QDRANT=http://127.0.0.1:6333 cargo test -p recall -- --ignored
+    /// --nocapture the_phases_of_a_recall`.
+    #[tokio::test]
+    #[ignore]
+    async fn the_phases_of_a_recall() {
+        let url = std::env::var("RECALL_TEST_QDRANT").expect("RECALL_TEST_QDRANT");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/models/bge-small-en-v1.5");
+        let e: Arc<dyn Embed> =
+            Arc::new(Onnx::load(&dir.join("model.onnx"), &dir.join("tokenizer.json"), false).unwrap());
+        let store = Store::open(Config { qdrant_url: url, collection: "recall_phases".into(), timeout_ms: 5000 }, e.clone())
+            .await
+            .unwrap();
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
+        let items: Vec<Item> = (0..40)
+            .map(|i| Item {
+                namespace: "jade".into(),
+                kind: "exchange".into(),
+                key: format!("k{i}"),
+                text: format!("They said: memory number {i} about the kettle and the filter — I answered: noted."),
+                ts_unix_ms: 1_700_000_000_000 + i,
+                private: false,
+                meta: BTreeMap::new(),
+            })
+            .collect();
+        store.upsert(&items).await.unwrap();
+
+        let e2 = e.clone();
+        let text = "what did I say about the kettle".to_string();
+        let mut embed_ms = Vec::new();
+        let mut hop_ms = Vec::new();
+        for _ in 0..12 {
+            let (t0, q) = (std::time::Instant::now(), text.clone());
+            let vector = match e2.embed(&[q], Role::Query) {
+                Ok(mut v) => {
+                    embed_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    v.remove(0)
+                }
+                Err(e) => panic!("embed: {e:#}"),
+            };
+            let t1 = std::time::Instant::now();
+            let body = json!({ "vector": vector, "limit": 8, "with_payload": true, "score_threshold": 0.0 });
+            let resp = store.client.post(store.url("/points/search")).json(&body).send().await.unwrap();
+            assert!(resp.status().is_success());
+            let _: Value = resp.json().await.unwrap();
+            hop_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (emb, hop) = (med(&mut embed_ms), med(&mut hop_ms));
+        println!("recall phases over 12 queries: embed p50 {emb:.1} ms, qdrant hop p50 {hop:.1} ms");
+        // **Six milliseconds is not a 150 ms miss, so the cost is not one query's work.**
+        // The session is a `parking_lot::Mutex<Session>` and every embed holds it, so the
+        // suspect is *concurrency*: several recalls in flight at once queue on the same
+        // session, and a turn that waits behind three others pays their sum. Measured with
+        // four threads against the same embedder, which is the shape a turn has when the
+        // memory write, the recall and the speaker model all touch it.
+        let mut concurrent = Vec::new();
+        for _ in 0..4 {
+            let e3 = e.clone();
+            let t = std::time::Instant::now();
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let e3 = e3.clone();
+                    std::thread::spawn(move || {
+                        e3.embed(&[format!("a concurrent query number {i} about the kettle")], Role::Query).map(|_| ())
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+            concurrent.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let serial = med(&mut concurrent);
+        println!("four concurrent embeds: p50 {serial:.1} ms (one at a time {emb:.1} ms)");
+        // ...and under **load**, which is the state the live box was in: the same turn
+        // carried `llm_ttft_ms=4711` because of a tool call, with whisper, Kokoro and the
+        // search all busy. `Onnx::load` asks for two intra-op threads (`with_intra_threads(2)`)
+        // on a twelve-core box, so a loaded machine gives this session a fraction of a core.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load: Vec<_> = (0..12)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 1.0f64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        x = (x * 1.0000001 + 0.5).sin().abs() + 1.0;
+                    }
+                    std::hint::black_box(x);
+                })
+            })
+            .collect();
+        let mut loaded = Vec::new();
+        for _ in 0..8 {
+            let t = std::time::Instant::now();
+            e.embed(&[text.clone()], Role::Query).unwrap();
+            loaded.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in load {
+            h.join().unwrap();
+        }
+        let under_load = med(&mut loaded);
+        println!("embed under full CPU load: p50 {under_load:.1} ms (idle {emb:.1} ms)");
+        // **The write is the other caller, and it holds the same session.** `Store::upsert`
+        // embeds every item as a document in one blocking call under this mutex, and a
+        // memory write is the *whole exchange* — two points per turn plus the consolidator's
+        // facts — while a recall is one sentence. This measures what a query pays when it
+        // arrives behind a realistic write, which is the one number that can turn 6 ms into
+        // 150 ms: not the query's cost, but the queue it stands in.
+        let docs: Vec<String> = (0..8)
+            .map(|i| format!("They said: a whole spoken exchange number {i}, about forty words long, the kettle and the filter and the chores — I answered: noted, here is what I have."))
+            .collect();
+        let mut behind = Vec::new();
+        for _ in 0..6 {
+            let writer = e.clone();
+            let docs = docs.clone();
+            let h = std::thread::spawn(move || writer.embed(&docs, Role::Document));
+            let t = std::time::Instant::now();
+            e.embed(&["what did I say about the kettle".to_string()], Role::Query).unwrap();
+            behind.push(t.elapsed().as_secs_f64() * 1000.0);
+            h.join().unwrap().unwrap();
+        }
+        let queued = med(&mut behind);
+        println!("query arriving behind a write: p50 {queued:.1} ms (alone {emb:.1} ms)");
+        // ...and the split the production path now logs, read off the real store rather
+        // than a hand-timed embed: `search_timed` is what a recall calls, so this is the
+        // number a deadline miss will carry (`Phases::cost`).
+        let (_, phases) = store
+            .search_timed(&Query { namespace: Some("jade".into()), text: "kettle".into(), top_k: 8, min_score: 0.0, include_private: true, ..Default::default() })
+            .await
+            .unwrap();
+        println!(
+            "search_timed reports: embed {:.1} ms, hop {:.1} ms, cost {}",
+            phases.embed_ms,
+            phases.hop_ms,
+            phases.cost()
+        );
+        assert!(phases.total_ms() > 0.0);
+        // The hop is a loopback round trip and the embed runs the model: the split has to
+        // separate them, or a miss cannot say which half to fix.
+        assert!(phases.embed_ms > 0.0 && phases.hop_ms > 0.0);
+        // The measurement is the deliverable; the assertion is only that neither half is
+        // unmeasurable, so this cannot pass by printing nothing.
+        assert!(emb > 0.0 && hop > 0.0 && serial > 0.0 && under_load > 0.0 && queued > 0.0);
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
     }
 }
