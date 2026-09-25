@@ -421,8 +421,38 @@ impl Store {
         format!("{}/collections/{}{path}", self.cfg.qdrant_url.trim_end_matches('/'), self.cfg.collection)
     }
 
+    /// The vector size Qdrant reports for a collection, from a collection GET.
+    ///
+    /// One function so `ensure_collection` and `stats` read the store the same way: `Stats`
+    /// used to report the *embedder's* dimension as the store's, which agreed only while the
+    /// two happened to match (#201).
+    fn collection_dim(v: &Value) -> Option<usize> {
+        v["result"]["config"]["params"]["vectors"]["size"].as_u64().map(|n| n as usize)
+    }
+
     async fn ensure_collection(&self) -> Result<()> {
-        let exists = self.send(self.client.get(self.url(""))).await?.status().is_success();
+        let resp = self.send(self.client.get(self.url(""))).await?;
+        let exists = resp.status().is_success();
+        if exists {
+            // The collection is there — but is it the one **this embedder can write to**?
+            // Nothing compared them. Changing `[memory] model` to an encoder of another
+            // hidden size left every upsert and every search answering Qdrant's 400 while
+            // the health row still read `ok`, so the house silently stopped remembering
+            // (#201). Read-only (a full disk) and a wrong dimension look the same from
+            // here: both are conditions the process can see at start-up and not fix.
+            let v: Value = resp.json().await.context("reading the collection")?;
+            if let Some(dim) = Self::collection_dim(&v) {
+                anyhow::ensure!(
+                    dim == self.embed.dim(),
+                    "collection {} holds {dim}-dimensional vectors and {} produces {}: every \
+                     write and search would be refused by Qdrant. Point `[memory] collection` \
+                     at another collection, or re-embed into a new one",
+                    self.cfg.collection,
+                    self.embed.name(),
+                    self.embed.dim()
+                );
+            }
+        }
         if !exists {
             let dim = self.embed.dim();
             anyhow::ensure!(dim > 0, "the embedder has no dimension yet");
@@ -627,7 +657,10 @@ impl Store {
         let v: Value = self.send(self.client.get(self.url(""))).await?.error_for_status()?.json().await?;
         Ok(Stats {
             points: v["result"]["points_count"].as_u64().unwrap_or(0),
-            dim: self.embed.dim(),
+            // The collection's own size, which `open` has already checked against the
+            // embedder's: the fallback is for a Qdrant that does not report one, and the two
+            // numbers are the same by construction where `open` succeeded.
+            dim: Self::collection_dim(&v).unwrap_or_else(|| self.embed.dim()),
             collection: self.cfg.collection.clone(),
             embedder: self.embed.name().to_string(),
         })
@@ -637,6 +670,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collection's own vector size, read the way Qdrant writes it.
+    ///
+    /// `Stats` reported the embedder's dimension as the store's, and nothing compared them, so
+    /// a `[memory] model` change to another hidden size left every write and search refused
+    /// while the health row said `ok` (#201). `open` refuses that mismatch now, and this is the
+    /// reader both it and `stats` use.
+    #[test]
+    fn the_collections_own_size_is_what_qdrant_reports() {
+        let collection = json!({
+            "result": { "config": { "params": { "vectors": { "size": 1024, "distance": "Cosine" } } } }
+        });
+        assert_eq!(Store::collection_dim(&collection), Some(1024));
+        // A server that reports no size answers `None` rather than a zero: `stats` falls back
+        // to the embedder's, which `open` has already checked against the store's.
+        assert_eq!(Store::collection_dim(&json!({ "result": {} })), None);
+        assert_eq!(Store::collection_dim(&json!({})), None);
+    }
 
     #[test]
     fn a_point_id_is_a_function_of_namespace_kind_and_key() {
