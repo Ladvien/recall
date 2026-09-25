@@ -402,15 +402,22 @@ impl Store {
         Ok(this)
     }
 
-    /// One send, retried once on a transport error: a keep-alive connection Qdrant closed
-    /// between two calls fails the next request before any byte is answered, and that is
-    /// not the request's fault. A request that was answered is never retried.
+    /// One send, retried once **only when no byte can have reached the server**.
+    ///
+    /// A keep-alive connection Qdrant closed between two calls fails the next request before
+    /// any byte is answered, and that is not the request's fault. A **timeout** is the other
+    /// case: the request may well have executed, and in the pinned reqwest a client timeout is
+    /// built as a *request* error, so `is_connect() || is_request()` retried it — every upsert,
+    /// delete, set_payload and count ran twice against a slow Qdrant, at up to twice its
+    /// timeout, and the writer task then drained its bounded queue at half speed and started
+    /// dropping household memories (#202). The operations are idempotent, so nothing
+    /// corrupted; the documented guarantee was simply false.
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let again = req.try_clone();
         match req.send().await {
             Ok(r) => Ok(r),
-            Err(e) if (e.is_connect() || e.is_request()) && again.is_some() => {
-                tracing::debug!("recall: retrying after a transport error: {e}");
+            Err(e) if Self::may_retry(e.is_connect(), e.is_request(), e.is_timeout()) && again.is_some() => {
+                tracing::debug!("recall: retrying a send that reached nobody: {e}");
                 again.expect("checked").send().await.context("qdrant unreachable")
             }
             Err(e) => Err(e).context("qdrant unreachable"),
@@ -426,7 +433,16 @@ impl Store {
     /// One function so `ensure_collection` and `stats` read the store the same way: `Stats`
     /// used to report the *embedder's* dimension as the store's, which agreed only while the
     /// two happened to match (#201).
-    fn collection_dim(v: &Value) -> Option<usize> {
+    /// May a send be repeated? See [`Store::send`] for why a timeout may not.
+///
+/// Takes the three flags rather than a `reqwest::Error` because the error type cannot be
+/// constructed in a test: this is the decision, and the caller reads the flags off the error it
+/// has.
+fn may_retry(connect: bool, request: bool, timeout: bool) -> bool {
+    connect || (request && !timeout)
+}
+
+fn collection_dim(v: &Value) -> Option<usize> {
         v["result"]["config"]["params"]["vectors"]["size"].as_u64().map(|n| n as usize)
     }
 
@@ -677,6 +693,23 @@ mod tests {
     /// a `[memory] model` change to another hidden size left every write and search refused
     /// while the health row said `ok` (#201). `open` refuses that mismatch now, and this is the
     /// reader both it and `stats` use.
+    /// Only a failure that reached nobody may be repeated (#202).
+    ///
+    /// A connection that was never established, or a request error that is not a timeout: both
+    /// mean no byte was answered. A **timeout** may have executed server-side, and in the pinned
+    /// reqwest it arrives as a request error too — which is what made the old condition retry
+    /// it. The companion measurement, `a_client_timeout_is_a_request_error` in
+    /// `server/src/memory.rs`, asserts that classification against a listener that never
+    /// answers, so this rule cannot quietly stop being the right one.
+    #[test]
+    fn a_timeout_is_not_retried() {
+        assert!(may_retry(true, false, false), "a refused connection reached nobody");
+        assert!(may_retry(false, true, false), "a transport error that is not a timeout is safe");
+        assert!(!may_retry(false, true, true), "a timeout may have executed");
+        assert!(!may_retry(false, false, true), "and a bare timeout certainly may have");
+        assert!(!may_retry(false, false, false), "something else is not a retry reason either");
+    }
+
     #[test]
     fn the_collections_own_size_is_what_qdrant_reports() {
         let collection = json!({
