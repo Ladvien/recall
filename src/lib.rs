@@ -67,6 +67,10 @@ impl Onnx {
                 builder = builder
                     .with_execution_providers([ort::ep::CUDA::default().with_device_id(0).build()])
                     .map_err(|e| anyhow::anyhow!("ort cuda provider: {e}"))?;
+                // Said out loud, because the *absence* of this line is what tells an operator
+                // the build did not carry the feature — one warning for a build without it and
+                // no line at all is how `[memory] cuda = true` came to do nothing (#80).
+                tracing::info!("recall: embedding on the CUDA execution provider");
             }
             #[cfg(not(feature = "cuda"))]
             {
