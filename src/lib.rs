@@ -316,6 +316,17 @@ pub struct Stats {
     pub embedder: String,
 }
 
+/// The two Qdrant filters that decide what a retention prune may delete: made before the
+/// window, and not recalled inside it. One function, so every caller of the curve agrees
+/// about what "old" means — a `must`/`must_not` pair spelled at each call site is how the
+/// household prune came to delete memories `server memory prune` spared (#136).
+pub fn retention_filter(ts_unix_ms: i64) -> (Vec<Value>, Vec<Value>) {
+    (
+        vec![json!({ "key": "ts_unix_ms", "range": { "lt": ts_unix_ms } })],
+        vec![json!({ "key": "last_recalled_ms", "range": { "gte": ts_unix_ms } })],
+    )
+}
+
 /// An item read back from a point's payload: the six fixed fields, and every other
 /// string-valued key as `meta`. Integer payload values a later write added (a recall
 /// count, a stamp) are carried as their decimal text, so a reader can parse them back.
@@ -567,9 +578,18 @@ impl Store {
         Ok(n)
     }
 
-    /// Delete every point with `ts_unix_ms` before `ts`; with `dry_run` only count them.
+    /// Delete every memory made before `ts_unix_ms` that has **not** been recalled since.
+    ///
+    /// The forgetting curve's whole point is that reaching for a memory keeps it
+    /// (`docs/SOTA.md a-forgetting-curve-is-a-prune-that-spares-what-was-recalled`), so
+    /// this is the one place that decides what "old" means: a memory whose
+    /// `last_recalled_ms` is inside the window is not old, however old it was made. One
+    /// function and not a `must`/`must_not` pair built at each call site — the household
+    /// prune built only the first half and deleted memories the curve was meant to spare
+    /// (#136).
     pub async fn prune_before(&self, ts_unix_ms: i64, dry_run: bool) -> Result<u64> {
-        self.delete_where(vec![json!({ "key": "ts_unix_ms", "range": { "lt": ts_unix_ms } })], Vec::new(), dry_run).await
+        let (must, must_not) = retention_filter(ts_unix_ms);
+        self.delete_where(must, must_not, dry_run).await
     }
 
     /// Merge `payload` into one point's payload (existing keys are overwritten, the rest
@@ -833,6 +853,82 @@ mod tests {
         // The measurement is the deliverable; the assertion is only that neither half is
         // unmeasurable, so this cannot pass by printing nothing.
         assert!(emb > 0.0 && hop > 0.0 && serial > 0.0 && under_load > 0.0 && queued > 0.0);
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
+    }
+
+    /// **A prune spares what was recalled, and both callers agree about it.**
+    ///
+    /// `prune_before` used to delete on `ts_unix_ms` alone, so the household-wide
+    /// `server prune --apply` deleted memories the forgetting curve was meant to keep,
+    /// while `server memory prune` — which builds the `must_not` half by hand — spared
+    /// them: two counts for one window (#136). The filter is one function now, and this is
+    /// the measurement that says so, against a throwaway collection:
+    ///
+    /// `RECALL_TEST_QDRANT=http://127.0.0.1:6333 cargo test -p recall -- --ignored
+    /// --nocapture a_prune_spares_what_was_recalled`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_prune_spares_what_was_recalled() {
+        /// A stub with a real dimension: this test is about the filter, not the vectors,
+        /// and a store cannot open its collection without one.
+        struct Fixed;
+        impl Embed for Fixed {
+            fn dim(&self) -> usize {
+                4
+            }
+            fn name(&self) -> &str {
+                "fixed"
+            }
+            fn embed(&self, texts: &[String], _: Role) -> Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|t| vec![t.len() as f32, 0.0, 0.0, 1.0]).collect())
+            }
+        }
+
+        let url = std::env::var("RECALL_TEST_QDRANT").expect("RECALL_TEST_QDRANT");
+        let store = Store::open(
+            Config { qdrant_url: url, collection: "recall_retention".into(), timeout_ms: 5000 },
+            Arc::new(Fixed),
+        )
+        .await
+        .unwrap();
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
+        let old = 1_600_000_000_000i64;
+        let cutoff = 1_700_000_000_000i64;
+        let item = |key: &str, ts| Item {
+            namespace: "jade".into(),
+            kind: "exchange".into(),
+            key: key.into(),
+            text: format!("memory {key} about the kettle"),
+            ts_unix_ms: ts,
+            private: false,
+            meta: BTreeMap::new(),
+        };
+        // Old and never reached for; old but recalled inside the window; new. The
+        // `last_recalled_ms` stamp is a JSON **number**, which is what `Memory::touch`
+        // writes through `set_payload` — as `meta` it would land as a string and the
+        // range filter would miss it, which is the instrument's job to get right.
+        store
+            .upsert(&[item("forgotten", old), item("reached-for", old), item("fresh", cutoff + 1_000)])
+            .await
+            .unwrap();
+        let reached = store.scroll(vec![json!({ "key": "key", "match": { "value": "reached-for" } })], 1).await.unwrap();
+        assert_eq!(reached.len(), 1, "the recalled memory is in the store");
+        store
+            .set_payload(reached[0].id(), json!({ "recalled": 1, "last_recalled_ms": cutoff + 1_000 }))
+            .await
+            .unwrap();
+
+        // The dry run is the count, and it must be one: only the memory nobody reached for.
+        let counted = store.prune_before(cutoff, true).await.unwrap();
+        assert_eq!(counted, 1, "only the memory that was never recalled is old");
+        // ...and the same number twice, which is what "both commands agree" means.
+        assert_eq!(store.prune_before(cutoff, true).await.unwrap(), 1);
+        let deleted = store.prune_before(cutoff, false).await.unwrap();
+        assert_eq!(deleted, 1);
+        let left = store.scroll(vec![json!({ "key": "namespace", "match": { "value": "jade" } })], 10).await.unwrap();
+        let keys: Vec<&str> = left.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&"reached-for") && keys.contains(&"fresh"), "{keys:?}");
+        assert!(!keys.contains(&"forgotten"), "{keys:?}");
         store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
     }
 }
