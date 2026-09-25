@@ -556,6 +556,25 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Delete these exact points; the count. `has_id` is a filter like any other, so this
+    /// is the same round trip `delete_where` makes — with the one selector that cannot take
+    /// a neighbour with it.
+    ///
+    /// What a **replacement** needs: a consolidating pass writes an exchange's new facts
+    /// and then removes the old ones it did not re-state, so an interrupted pass leaves the
+    /// old facts or the new ones and never neither (#137).
+    pub async fn delete_ids(&self, ids: &[uuid::Uuid]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let filter = json!({ "must": [{ "has_id": ids.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>() }] });
+        let resp = self
+            .send(self.client.post(format!("{}?wait=true", self.url("/points/delete"))).json(&json!({ "filter": filter })))
+            .await?;
+        anyhow::ensure!(resp.status().is_success(), "delete by id: {}", resp.status());
+        Ok(ids.len() as u64)
+    }
+
     /// Delete every point matching `must` (and none of `must_not`); with `dry_run` only
     /// count them. The count is exact and taken first, so the number reported is the
     /// number deleted.
@@ -929,6 +948,78 @@ mod tests {
         let keys: Vec<&str> = left.iter().map(|i| i.key.as_str()).collect();
         assert!(keys.contains(&"reached-for") && keys.contains(&"fresh"), "{keys:?}");
         assert!(!keys.contains(&"forgotten"), "{keys:?}");
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
+    }
+
+    /// **A replacement writes before it deletes, so an interrupted pass leaves one set or
+    /// the other and never neither.**
+    ///
+    /// The consolidator used to delete a turn's facts as soon as its model stream ended,
+    /// and write the replacements only once at the end of the whole pass: one failure after
+    /// that point (a stream error on the next exchange, a store hiccup) left every
+    /// processed turn with its facts gone (#137). `delete_ids` is the half that makes the
+    /// safe order possible — the old ones are removed by id, after the new ones are in.
+    ///
+    /// `RECALL_TEST_QDRANT=http://127.0.0.1:6333 cargo test -p recall --features
+    /// ort-binaries -- --ignored --nocapture a_replacement_writes_before_it_deletes`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_replacement_writes_before_it_deletes() {
+        struct Fixed;
+        impl Embed for Fixed {
+            fn dim(&self) -> usize {
+                4
+            }
+            fn name(&self) -> &str {
+                "fixed"
+            }
+            fn embed(&self, texts: &[String], _: Role) -> Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|t| vec![t.len() as f32, 0.0, 0.0, 1.0]).collect())
+            }
+        }
+        let url = std::env::var("RECALL_TEST_QDRANT").expect("RECALL_TEST_QDRANT");
+        let store = Store::open(
+            Config { qdrant_url: url, collection: "recall_replace".into(), timeout_ms: 5000 },
+            Arc::new(Fixed),
+        )
+        .await
+        .unwrap();
+        store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
+        let fact = |key: &str, turn: &str| {
+            let mut meta = BTreeMap::new();
+            meta.insert("from_turn".to_string(), turn.to_string());
+            Item {
+                namespace: "jade".into(),
+                kind: "fact".into(),
+                key: key.into(),
+                text: format!("fact {key}"),
+                ts_unix_ms: 1_700_000_000_000,
+                private: false,
+                meta,
+            }
+        };
+        let by_turn = |turn: &str| {
+            vec![json!({ "key": "kind", "match": { "value": "fact" } }),
+                 json!({ "key": "from_turn", "match": { "value": turn } })]
+        };
+        // An earlier pass's facts for one turn.
+        store.upsert(&[fact("old-a", "t1"), fact("old-b", "t1")]).await.unwrap();
+        assert_eq!(store.scroll(by_turn("t1"), 10).await.unwrap().len(), 2);
+        // What the fixed pass does: write the replacements, then delete the old ones that
+        // were not re-stated — in that order.
+        store.upsert(&[fact("old-a", "t1"), fact("new-c", "t1")]).await.unwrap();
+        let before = store.scroll(by_turn("t1"), 10).await.unwrap();
+        let kept: Vec<uuid::Uuid> = vec![fact("old-a", "t1").id(), fact("new-c", "t1").id()];
+        let stale: Vec<uuid::Uuid> =
+            before.iter().map(Item::id).filter(|id| !kept.contains(id)).collect();
+        assert_eq!(store.delete_ids(&stale).await.unwrap(), 1, "only old-b goes");
+        let left = store.scroll(by_turn("t1"), 10).await.unwrap();
+        let keys: Vec<&str> = left.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&"old-a") && keys.contains(&"new-c"), "{keys:?}");
+        // And an empty replacement (a model that answered `none`) removes the old facts
+        // without writing anything: the pass that *did* complete replaces them with nothing.
+        assert_eq!(store.delete_ids(&left.iter().map(Item::id).collect::<Vec<_>>()).await.unwrap(), 2);
+        assert!(store.scroll(by_turn("t1"), 10).await.unwrap().is_empty());
         store.delete_where(Vec::new(), Vec::new(), true).await.unwrap();
     }
 }
